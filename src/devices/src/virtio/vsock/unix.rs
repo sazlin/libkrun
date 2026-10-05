@@ -416,7 +416,12 @@ impl UnixProxy {
     }
 
     fn maybe_push_credit_update(&mut self, update: &mut ProxyUpdate) {
-        if ((self.tx_cnt - self.last_tx_cnt_sent).0 as usize) < defs::CONN_CREDIT_UPDATE_THRESHOLD {
+        if !matches!(
+            self.status,
+            ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate
+        ) || ((self.tx_cnt - self.last_tx_cnt_sent).0 as usize)
+            < defs::CONN_CREDIT_UPDATE_THRESHOLD
+        {
             return;
         }
 
@@ -432,11 +437,16 @@ impl UnixProxy {
     }
 
     fn connected_poll_events(&self) -> EventSet {
-        if self.pending_write.is_empty() {
-            EventSet::IN
-        } else {
-            EventSet::IN | EventSet::OUT
+        let mut events = match self.status {
+            ProxyStatus::Connected => EventSet::IN,
+            ProxyStatus::WaitingCreditUpdate => EventSet::empty(),
+            ProxyStatus::Connecting => return EventSet::IN | EventSet::OUT,
+            _ => return EventSet::empty(),
+        };
+        if !self.pending_write.is_empty() {
+            events |= EventSet::OUT;
         }
+        events
     }
 
     fn init_data_pkt(&self, pkt: &mut VsockPacket) {
@@ -574,7 +584,7 @@ impl Proxy for UnixProxy {
             -libc::EINVAL
         };
 
-        if ret > 0 && self.status == ProxyStatus::Connected {
+        if ret > 0 {
             self.maybe_push_credit_update(&mut update);
         }
 
@@ -752,8 +762,11 @@ impl Proxy for UnixProxy {
                     return update;
                 } else if self.status == ProxyStatus::WaitingCreditUpdate {
                     debug!("process_event: WaitingCreditUpdate");
-                    update.polling =
-                        Some((self.id(), self.endpoint.as_raw_fd(), EventSet::empty()));
+                    update.polling = Some((
+                        self.id(),
+                        self.endpoint.as_raw_fd(),
+                        self.connected_poll_events(),
+                    ));
                 }
             } else {
                 debug!("EventSet::IN while not connected: {:?}", self.status);
@@ -787,15 +800,16 @@ impl Proxy for UnixProxy {
                     self.status = ProxyStatus::Closed;
                     update.remove_proxy = ProxyRemoval::Deferred;
                 }
-                if self.status == ProxyStatus::Connected {
-                    self.maybe_push_credit_update(&mut update);
-                }
+                self.maybe_push_credit_update(&mut update);
                 update.polling = Some((
                     self.id(),
                     self.endpoint.as_raw_fd(),
                     self.connected_poll_events(),
                 ));
-            } else if self.status == ProxyStatus::Connected {
+            } else if matches!(
+                self.status,
+                ProxyStatus::Connected | ProxyStatus::WaitingCreditUpdate
+            ) {
                 if let Err(err) = self.flush_pending_write() {
                     warn!("vsock backend write failed: {err}");
                     self.push_reset();
@@ -803,9 +817,7 @@ impl Proxy for UnixProxy {
                     update.signal_queue = true;
                     update.remove_proxy = ProxyRemoval::Deferred;
                 }
-                if self.status == ProxyStatus::Connected {
-                    self.maybe_push_credit_update(&mut update);
-                }
+                self.maybe_push_credit_update(&mut update);
                 update.polling = Some((
                     self.id(),
                     self.endpoint.as_raw_fd(),
@@ -987,7 +999,16 @@ mod tests {
 
     #[test]
     fn blocked_peer_receives_credit_only_as_the_socket_drains() {
+        for status in [ProxyStatus::Connected, ProxyStatus::WaitingCreditUpdate] {
+            check_blocked_peer_credit(status);
+        }
+    }
+
+    fn check_blocked_peer_credit(status: ProxyStatus) {
         let (mut proxy, mut peer, packet) = connected_proxy();
+        proxy.status = status;
+        proxy.rxq.lock().unwrap().clear();
+
         let mut sent = 0;
 
         while proxy.pending_write.is_empty() {
@@ -1023,7 +1044,15 @@ mod tests {
             if received == sent {
                 break;
             }
-            proxy.process_event(EventSet::OUT);
+            let update = proxy.process_event(EventSet::OUT);
+            if status == ProxyStatus::WaitingCreditUpdate {
+                let events = update.polling.expect("update writable polling").2;
+                assert!(!events.contains(EventSet::IN));
+                assert_eq!(
+                    events.contains(EventSet::OUT),
+                    !proxy.pending_write.is_empty()
+                );
+            }
         }
         assert_eq!(received, sent);
         assert!(proxy.pending_write.is_empty());
