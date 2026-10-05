@@ -619,7 +619,8 @@ impl Proxy for TsiStreamProxy {
         };
 
         if ret > 0
-            && (self.tx_cnt - self.last_tx_cnt_sent).0 as usize >= (defs::CONN_TX_BUF_SIZE / 2)
+            && (self.tx_cnt - self.last_tx_cnt_sent).0 as usize
+                >= defs::CONN_CREDIT_UPDATE_THRESHOLD
         {
             debug!(
                 "sending credit update: id={}, tx_cnt={}, last_tx_cnt={}",

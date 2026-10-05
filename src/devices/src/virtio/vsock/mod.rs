@@ -95,6 +95,10 @@ mod defs {
 
     #[cfg(unix)]
     pub const CONN_TX_BUF_SIZE: usize = 8 * 1024 * 1024;
+    // Credit updates must arrive before a small guest socket transmit buffer fills,
+    // independently of the receive window advertised to the guest.
+    #[cfg(unix)]
+    pub const CONN_CREDIT_UPDATE_THRESHOLD: usize = 32 * 1024;
     #[cfg(unix)]
     pub const SOCK_STREAM: u16 = 1;
     #[cfg(unix)]
