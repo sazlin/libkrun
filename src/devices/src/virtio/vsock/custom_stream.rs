@@ -10,7 +10,7 @@ use utils::epoll::EventSet;
 use vm_memory::GuestMemoryMmap;
 
 use super::super::Queue as VirtQueue;
-use super::defs::{self, uapi};
+use super::defs::uapi;
 use super::muxer::{push_packet, MuxerRx};
 use super::muxer_rxq::MuxerRxQ;
 use super::packet::VsockPacket;
@@ -18,6 +18,13 @@ use super::packet::VsockPacket;
 use super::packet::{TsiAcceptReq, TsiConnectReq, TsiListenReq, TsiSendtoAddr};
 use super::proxy::{Proxy, ProxyRemoval, ProxyStatus, ProxyUpdate, RecvPkt};
 use super::{VsockConnectState, VsockNotifier, VsockPollable, VsockShutdown, VsockStreamBackend};
+
+//--------------------------------------------------------------------------------------------------
+// Constants
+//--------------------------------------------------------------------------------------------------
+
+// Return credit at half this window, before a small guest transmit buffer fills.
+const CUSTOM_STREAM_TX_BUF_SIZE: usize = 64 * 1024;
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -135,6 +142,7 @@ impl CustomStreamProxy {
         push_packet(
             self.cid,
             MuxerRx::OpResponse {
+                buf_alloc: CUSTOM_STREAM_TX_BUF_SIZE as u32,
                 local_port: self.local_port,
                 peer_port: self.peer_port,
             },
@@ -258,7 +266,7 @@ impl CustomStreamProxy {
     /// Return stream credit only after the host backend has consumed bytes
     /// from the bounded proxy queue.
     fn maybe_push_credit_update(&mut self, update: &mut ProxyUpdate) {
-        if ((self.tx_cnt - self.last_tx_cnt_sent).0 as usize) < defs::CONN_TX_BUF_SIZE / 2 {
+        if ((self.tx_cnt - self.last_tx_cnt_sent).0 as usize) < CUSTOM_STREAM_TX_BUF_SIZE / 2 {
             return;
         }
 
@@ -266,6 +274,7 @@ impl CustomStreamProxy {
         push_packet(
             self.cid,
             MuxerRx::CreditUpdate {
+                buf_alloc: CUSTOM_STREAM_TX_BUF_SIZE as u32,
                 local_port: self.local_port,
                 peer_port: self.peer_port,
                 fwd_cnt: self.tx_cnt.0,
@@ -284,7 +293,7 @@ impl CustomStreamProxy {
             .set_src_port(self.local_port)
             .set_dst_port(self.peer_port)
             .set_type(uapi::VSOCK_TYPE_STREAM)
-            .set_buf_alloc(defs::CONN_TX_BUF_SIZE as u32)
+            .set_buf_alloc(CUSTOM_STREAM_TX_BUF_SIZE as u32)
             .set_fwd_cnt(self.tx_cnt.0);
     }
 
@@ -356,7 +365,7 @@ impl Proxy for CustomStreamProxy {
             self.fail(&mut update, "custom vsock backend write failed", &err);
             return update;
         }
-        if buf.len() > defs::CONN_TX_BUF_SIZE.saturating_sub(self.pending_write.len()) {
+        if buf.len() > CUSTOM_STREAM_TX_BUF_SIZE.saturating_sub(self.pending_write.len()) {
             let err = io::Error::new(
                 io::ErrorKind::InvalidData,
                 "guest exceeded the custom vsock stream receive window",
@@ -489,6 +498,7 @@ impl Proxy for CustomStreamProxy {
             if wait_credit {
                 self.status = ProxyStatus::WaitingCreditUpdate;
                 update.push_credit_req = Some(MuxerRx::CreditRequest {
+                    buf_alloc: CUSTOM_STREAM_TX_BUF_SIZE as u32,
                     local_port: self.local_port,
                     peer_port: self.peer_port,
                     fwd_cnt: self.tx_cnt.0,
@@ -669,12 +679,27 @@ mod tests {
         let pkt = tx_packet(&mem, 4096, &[b'x'; 4096]);
         let mut proxy = test_proxy(Arc::clone(&state), mem.clone());
 
+        let control_mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let mut control = tx_packet(&control_mem, 0, &[]);
+        proxy.push_connect_response();
+        let response = proxy.rxq.lock().unwrap().pop().unwrap();
+        assert!(super::super::muxer_rxq::rx_to_pkt(
+            3,
+            response,
+            &mut control
+        ));
+        assert_eq!(control.buf_alloc(), 64 * 1024);
+
         // A guest must not need megabytes of outstanding data to get its first
         // credit update: ordinary socket transmit buffers are much smaller.
         for _ in 0..32 {
             proxy.sendmsg(&pkt);
-            if let Some(MuxerRx::CreditUpdate { fwd_cnt, .. }) = proxy.rxq.lock().unwrap().pop() {
+            if let Some(rx @ MuxerRx::CreditUpdate { fwd_cnt, .. }) =
+                proxy.rxq.lock().unwrap().pop()
+            {
                 assert_eq!(fwd_cnt as usize, state.written.lock().unwrap().len());
+                assert!(super::super::muxer_rxq::rx_to_pkt(3, rx, &mut control));
+                assert_eq!(control.buf_alloc(), 64 * 1024);
                 return;
             }
         }
@@ -691,11 +716,11 @@ mod tests {
         let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
         let pkt = tx_packet(&mem, 1, b"x");
         let mut proxy = test_proxy(state, mem.clone());
-        proxy.pending_write.resize(defs::CONN_TX_BUF_SIZE, 0);
+        proxy.pending_write.resize(CUSTOM_STREAM_TX_BUF_SIZE, 0);
 
         let update = proxy.sendmsg(&pkt);
 
         assert!(matches!(update.remove_proxy, ProxyRemoval::Immediate));
-        assert_eq!(proxy.pending_write.len(), defs::CONN_TX_BUF_SIZE);
+        assert_eq!(proxy.pending_write.len(), CUSTOM_STREAM_TX_BUF_SIZE);
     }
 }

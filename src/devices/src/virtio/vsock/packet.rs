@@ -527,8 +527,22 @@ impl VsockPacket {
         }
     }
 
+    #[cfg(unix)]
+    fn address_bytes(buf: &[u8], addr_len: u32) -> Option<&[u8]> {
+        let buf = buf.get(..addr_len as usize)?;
+        let family = byte_order::read_le_u16(buf.get(..2)?);
+        let minimum = match family {
+            defs::LINUX_AF_INET => 16,
+            defs::LINUX_AF_INET6 => 28,
+            defs::LINUX_AF_UNIX => 2,
+            _ => return None,
+        };
+        (buf.len() >= minimum).then_some(buf)
+    }
+
     #[cfg(target_os = "linux")]
     fn parse_address(buf: &[u8], addr_len: u32) -> Option<SockaddrStorage> {
+        let buf = Self::address_bytes(buf, addr_len)?;
         let sockaddr: SockaddrStorage = unsafe {
             SockaddrStorage::from_raw(&buf[0] as *const _ as *const sockaddr, Some(addr_len))?
         };
@@ -551,7 +565,8 @@ impl VsockPacket {
     }
 
     #[cfg(target_os = "macos")]
-    fn parse_address(buf: &[u8], _addr_len: u32) -> Option<SockaddrStorage> {
+    fn parse_address(buf: &[u8], addr_len: u32) -> Option<SockaddrStorage> {
+        let buf = Self::address_bytes(buf, addr_len)?;
         let family: u16 = byte_order::read_le_u16(&buf[0..2]);
 
         match family {
@@ -590,10 +605,11 @@ impl VsockPacket {
 
     #[cfg(unix)]
     pub fn read_proxy_create(&self) -> Option<TsiProxyCreate> {
-        if self.buf_size() >= 6 {
-            let peer_port: u32 = byte_order::read_le_u32(&self.buf().unwrap()[0..]);
-            let family: u16 = byte_order::read_le_u16(&self.buf().unwrap()[4..]);
-            let _type: u16 = byte_order::read_le_u16(&self.buf().unwrap()[6..]);
+        let buf = self.payload()?;
+        if buf.len() >= 8 {
+            let peer_port: u32 = byte_order::read_le_u32(&buf[0..]);
+            let family: u16 = byte_order::read_le_u16(&buf[4..]);
+            let _type: u16 = byte_order::read_le_u16(&buf[6..]);
 
             Some(TsiProxyCreate {
                 peer_port,
@@ -607,8 +623,8 @@ impl VsockPacket {
 
     #[cfg(unix)]
     pub fn read_connect_req(&self) -> Option<TsiConnectReq> {
-        if self.buf_size() >= 4 {
-            let buf = self.buf().unwrap();
+        let buf = self.payload()?;
+        if buf.len() >= 8 {
             let peer_port: u32 = byte_order::read_le_u32(&buf[0..]);
             let addr_len: u32 = byte_order::read_le_u32(&buf[4..]);
             let addr = Self::parse_address(&buf[8..], addr_len)?;
@@ -630,10 +646,11 @@ impl VsockPacket {
 
     #[cfg(unix)]
     pub fn read_getname_req(&self) -> Option<TsiGetnameReq> {
-        if self.buf_size() >= 12 {
-            let peer_port: u32 = byte_order::read_le_u32(&self.buf().unwrap()[0..]);
-            let local_port: u32 = byte_order::read_le_u32(&self.buf().unwrap()[4..]);
-            let peer: u32 = byte_order::read_le_u32(&self.buf().unwrap()[8..]);
+        let buf = self.payload()?;
+        if buf.len() >= 12 {
+            let peer_port: u32 = byte_order::read_le_u32(&buf[0..]);
+            let local_port: u32 = byte_order::read_le_u32(&buf[4..]);
+            let peer: u32 = byte_order::read_le_u32(&buf[8..]);
             Some(TsiGetnameReq {
                 peer_port,
                 local_port,
@@ -675,8 +692,8 @@ impl VsockPacket {
 
     #[cfg(unix)]
     pub fn read_sendto_addr(&self) -> Option<TsiSendtoAddr> {
-        if self.buf_size() >= 4 {
-            let buf = self.buf().unwrap();
+        let buf = self.payload()?;
+        if buf.len() >= 8 {
             let peer_port: u32 = byte_order::read_le_u32(&buf[0..]);
             let addr_len: u32 = byte_order::read_le_u32(&buf[4..]);
             let addr = Self::parse_address(&buf[8..], addr_len)?;
@@ -689,8 +706,8 @@ impl VsockPacket {
 
     #[cfg(unix)]
     pub fn read_listen_req(&self) -> Option<TsiListenReq> {
-        if self.buf_size() >= 12 {
-            let buf = self.buf().unwrap();
+        let buf = self.payload()?;
+        if buf.len() >= 16 {
             let peer_port: u32 = byte_order::read_le_u32(&buf[0..]);
             let vm_port: u32 = byte_order::read_le_u32(&buf[4..]);
             let backlog: u32 = byte_order::read_le_u32(&buf[8..]);
@@ -719,9 +736,10 @@ impl VsockPacket {
 
     #[cfg(unix)]
     pub fn read_accept_req(&self) -> Option<TsiAcceptReq> {
-        if self.buf_size() >= 8 {
-            let peer_port: u32 = byte_order::read_le_u32(&self.buf().unwrap()[0..]);
-            let flags: u32 = byte_order::read_le_u32(&self.buf().unwrap()[4..]);
+        let buf = self.payload()?;
+        if buf.len() >= 8 {
+            let peer_port: u32 = byte_order::read_le_u32(&buf[0..]);
+            let flags: u32 = byte_order::read_le_u32(&buf[4..]);
 
             Some(TsiAcceptReq { peer_port, flags })
         } else {
@@ -740,9 +758,10 @@ impl VsockPacket {
 
     #[cfg(unix)]
     pub fn read_release_req(&self) -> Option<TsiReleaseReq> {
-        if self.buf_size() >= 8 {
-            let peer_port: u32 = byte_order::read_le_u32(&self.buf().unwrap()[0..]);
-            let local_port: u32 = byte_order::read_le_u32(&self.buf().unwrap()[4..]);
+        let buf = self.payload()?;
+        if buf.len() >= 8 {
+            let peer_port: u32 = byte_order::read_le_u32(&buf[0..]);
+            let local_port: u32 = byte_order::read_le_u32(&buf[4..]);
             Some(TsiReleaseReq {
                 peer_port,
                 local_port,
@@ -860,6 +879,70 @@ mod tests {
                 mem.read_obj::<u32>(GuestAddress(0x2018)).unwrap().to_le(),
                 8
             );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_short_tsi_requests() {
+        for fragmented in [false, true] {
+            for len in 2..16 {
+                let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+                let first_len = if fragmented { 1 } else { len };
+                for (index, descriptor) in [
+                    Descriptor {
+                        addr: 0x2000,
+                        len: VSOCK_PKT_HDR_SIZE as u32,
+                        flags: 1,
+                        next: 1,
+                    },
+                    Descriptor {
+                        addr: 0x3000,
+                        len: first_len,
+                        flags: if fragmented { 1 } else { 0 },
+                        next: 2,
+                    },
+                    Descriptor {
+                        addr: 0x4000,
+                        len: len - first_len,
+                        flags: 0,
+                        next: 0,
+                    },
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    mem.write_obj(descriptor, GuestAddress(0x1000 + index as u64 * 16))
+                        .unwrap();
+                }
+                mem.write_obj(len.to_le(), GuestAddress(0x2018)).unwrap();
+                let head = DescriptorChain::checked_new(&mem, GuestAddress(0x1000), 3, 0).unwrap();
+                let packet = VsockPacket::from_tx_virtq_head(&head).unwrap();
+
+                assert_eq!(packet.read_proxy_create().is_some(), len >= 8);
+                assert_eq!(packet.read_getname_req().is_some(), len >= 12);
+                assert_eq!(packet.read_accept_req().is_some(), len >= 8);
+                assert_eq!(packet.read_release_req().is_some(), len >= 8);
+                assert!(packet.read_connect_req().is_none());
+                assert!(packet.read_sendto_addr().is_none());
+                assert!(packet.read_listen_req().is_none());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validates_tsi_address_lengths() {
+        for (family, size) in [(defs::LINUX_AF_INET, 16), (defs::LINUX_AF_INET6, 28)] {
+            let mut address = vec![0u8; size];
+            address[..2].copy_from_slice(&family.to_le_bytes());
+
+            for len in 0..size {
+                assert!(VsockPacket::parse_address(&address[..len], size as u32).is_none());
+                assert!(VsockPacket::parse_address(&address, len as u32).is_none());
+            }
+            assert!(VsockPacket::parse_address(&address, size as u32).is_some());
+            assert!(VsockPacket::parse_address(&address, u32::MAX).is_none());
         }
     }
 
