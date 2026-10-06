@@ -16,6 +16,11 @@
 /// the connection pool. When an out-of-sync is drained, the muxer will discard it, and attempt to
 /// rebuild a synced one.
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+
+use vm_memory::GuestMemoryMmap;
+
+use super::super::Queue as VirtQueue;
 
 use super::defs;
 use super::defs::uapi;
@@ -98,7 +103,47 @@ impl MuxerRxQ {
     }
 }
 
+/// Deliver or queue a control packet. A false result leaves retry ownership
+/// with the caller; the bounded queue must never silently acknowledge delivery.
+pub fn push_packet(
+    cid: u64,
+    rx: MuxerRx,
+    rxq_mutex: &Arc<Mutex<MuxerRxQ>>,
+    queue_mutex: &Arc<Mutex<VirtQueue>>,
+    mem: &GuestMemoryMmap,
+) -> bool {
+    let mut queue = queue_mutex.lock().unwrap();
+    let mut rxq = rxq_mutex.lock().unwrap();
+    if !rxq.is_empty() {
+        return rxq.push(rx);
+    }
+
+    while let Some(head) = queue.pop(mem) {
+        match VsockPacket::from_rx_virtq_head(&head) {
+            Ok(mut pkt) => {
+                if !rx_to_pkt(cid, rx, &mut pkt) {
+                    queue.undo_pop();
+                    return false;
+                }
+                return queue
+                    .add_used(mem, head.index, pkt.hdr().len() as u32 + pkt.len())
+                    .map_err(|err| error!("failed to add used elements to the queue: {err:?}"))
+                    .is_ok();
+            }
+            Err(err) => {
+                warn!("invalid vsock RX descriptor: {err:?}");
+                if let Err(err) = queue.add_used(mem, head.index, 0) {
+                    error!("failed to return invalid RX descriptor: {err:?}");
+                    return false;
+                }
+            }
+        }
+    }
+    rxq.push(rx)
+}
+
 pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) -> bool {
+    pkt.hdr_mut().fill(0);
     match rx {
         MuxerRx::Reset {
             local_port,
@@ -271,4 +316,90 @@ pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) -> bool {
     }
 
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::virtio::{Descriptor, DescriptorChain};
+    use vm_memory::{Bytes, GuestAddress, GuestMemoryMmap};
+
+    #[test]
+    fn invalid_rx_descriptor_is_returned_before_delivering_control() {
+        use crate::virtio::queue::tests::VirtQueue as TestQueue;
+
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        let guest_queue = TestQueue::new(GuestAddress(0), &mem, 2);
+        for index in 0..2 {
+            guest_queue.dtable[index]
+                .addr
+                .set(0x2000 + index as u64 * 128);
+            guest_queue.dtable[index].len.set(128);
+            guest_queue.dtable[index]
+                .flags
+                .set(if index == 0 { 0 } else { 2 });
+            guest_queue.avail.ring[index].set(index as u16);
+        }
+        guest_queue.avail.idx.set(2);
+        let queue = Arc::new(Mutex::new(guest_queue.create_queue()));
+        let rxq = Arc::new(Mutex::new(MuxerRxQ::new()));
+
+        super::super::muxer::push_packet(
+            3,
+            MuxerRx::CreditUpdate {
+                buf_alloc: 65536,
+                local_port: 1,
+                peer_port: 2,
+                fwd_cnt: 32768,
+            },
+            &rxq,
+            &queue,
+            &mem,
+        );
+
+        assert_eq!(guest_queue.used.idx.get(), 2);
+        assert_eq!(guest_queue.used.ring[0].get().id, 0);
+        assert_eq!(guest_queue.used.ring[0].get().len, 0);
+        assert_eq!(guest_queue.used.ring[1].get().id, 1);
+        assert_eq!(guest_queue.used.ring[1].get().len, 44);
+    }
+
+    #[test]
+    fn credit_packets_clear_stale_guest_header_fields() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x4000)]).unwrap();
+        mem.write_obj(
+            Descriptor {
+                addr: 0x2000,
+                len: 128,
+                flags: 2,
+                next: 0,
+            },
+            GuestAddress(0x1000),
+        )
+        .unwrap();
+        for rx in [
+            MuxerRx::CreditRequest {
+                buf_alloc: 65536,
+                local_port: 1,
+                peer_port: 2,
+                fwd_cnt: 32768,
+            },
+            MuxerRx::CreditUpdate {
+                buf_alloc: 65536,
+                local_port: 1,
+                peer_port: 2,
+                fwd_cnt: 32768,
+            },
+        ] {
+            mem.write_slice(&[0xff; 128], GuestAddress(0x2000)).unwrap();
+            let head = DescriptorChain::checked_new(&mem, GuestAddress(0x1000), 1, 0).unwrap();
+            let mut pkt = VsockPacket::from_rx_virtq_head(&head).unwrap();
+            assert!(rx_to_pkt(3, rx, &mut pkt));
+            assert_eq!(pkt.len(), 0);
+            assert_eq!(pkt.flags(), 0);
+            assert_eq!(pkt.fwd_cnt(), 32768);
+        }
+    }
 }

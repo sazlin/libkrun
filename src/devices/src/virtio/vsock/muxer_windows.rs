@@ -90,36 +90,7 @@ pub struct VsockMuxer {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
-pub fn push_packet(
-    cid: u64,
-    rx: MuxerRx,
-    rxq_mutex: &Arc<Mutex<MuxerRxQ>>,
-    queue_mutex: &Arc<Mutex<VirtQueue>>,
-    mem: &GuestMemoryMmap,
-) {
-    let mut queue = queue_mutex.lock().unwrap();
-    let mut rxq = rxq_mutex.lock().unwrap();
-    if !rxq.is_empty() {
-        rxq.push(rx);
-        return;
-    }
-
-    if let Some(head) = queue.pop(mem) {
-        if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
-            if rx_to_pkt(cid, rx, &mut pkt) {
-                if let Err(err) =
-                    queue.add_used(mem, head.index, pkt.hdr().len() as u32 + pkt.len())
-                {
-                    error!("failed to add used elements to the queue: {err:?}");
-                }
-            } else {
-                queue.undo_pop();
-            }
-        }
-    } else {
-        rxq.push(rx);
-    }
-}
+pub use super::muxer_rxq::push_packet;
 
 //--------------------------------------------------------------------------------------------------
 // Methods
@@ -231,10 +202,16 @@ impl VsockMuxer {
     }
 
     /// Retry proxy work after the caller has released the guest RX queue.
-    pub(crate) fn kick_backends(&self) {
+    pub(crate) fn kick_backends(&self, notify_backends: bool) -> bool {
+        let mut signal_queue = false;
         for proxy in self.proxy_map.read().unwrap().values() {
-            proxy.lock().unwrap().kick();
+            let mut proxy = proxy.lock().unwrap();
+            signal_queue |= proxy.retry_rx();
+            if notify_backends {
+                proxy.kick();
+            }
         }
+        signal_queue
     }
 
     fn update_polling(&self, id: u64, pollable: VsockPollable, events: EventSet) {

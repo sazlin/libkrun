@@ -145,8 +145,8 @@ impl Vsock {
         // capacity. Drop the virtqueue lock before taking proxy locks so the
         // muxer thread cannot deadlock in the opposite proxy -> queue order.
         drop(queue_rx);
-        if needs_backend_kick {
-            self.muxer.kick_backends();
+        if have_used || needs_backend_kick {
+            have_used |= self.muxer.kick_backends(needs_backend_kick);
         }
 
         have_used

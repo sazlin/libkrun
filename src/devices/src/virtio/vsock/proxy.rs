@@ -122,6 +122,10 @@ pub trait Proxy: Send {
     fn shutdown(&mut self, _pkt: &VsockPacket) {}
     fn release(&mut self) -> ProxyUpdate;
     fn process_event(&mut self, evset: EventSet) -> ProxyUpdate;
+    /// Retry control packets after guest RX descriptors or queue slots become available.
+    fn retry_rx(&mut self) -> bool {
+        false
+    }
     /// Retry backend work after the guest makes receive capacity available.
     fn kick(&self) {}
 }

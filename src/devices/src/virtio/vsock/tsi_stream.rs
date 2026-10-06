@@ -592,7 +592,7 @@ impl Proxy for TsiStreamProxy {
 
         let mut update = ProxyUpdate::default();
 
-        let ret = if let Some(buf) = pkt.buf() {
+        let ret = if let Some(buf) = pkt.payload() {
             #[cfg(target_os = "macos")]
             let flags = MsgFlags::empty();
             #[cfg(target_os = "linux")]

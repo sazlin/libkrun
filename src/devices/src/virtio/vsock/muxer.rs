@@ -112,36 +112,7 @@ pub enum MuxerRx {
     },
 }
 
-pub fn push_packet(
-    cid: u64,
-    rx: MuxerRx,
-    rxq_mutex: &Arc<Mutex<MuxerRxQ>>,
-    queue_mutex: &Arc<Mutex<VirtQueue>>,
-    mem: &GuestMemoryMmap,
-) {
-    let mut queue = queue_mutex.lock().unwrap();
-    let mut rxq = rxq_mutex.lock().unwrap();
-    if !rxq.is_empty() {
-        rxq.push(rx);
-        return;
-    }
-
-    if let Some(head) = queue.pop(mem) {
-        if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
-            if rx_to_pkt(cid, rx, &mut pkt) {
-                if let Err(e) = queue.add_used(mem, head.index, pkt.hdr().len() as u32 + pkt.len())
-                {
-                    error!("failed to add used elements to the queue: {e:?}");
-                }
-            } else {
-                queue.undo_pop();
-            }
-        }
-    } else {
-        error!("couldn't push pkt to queue, adding it to rxq");
-        rxq.push(rx);
-    }
-}
+pub use super::muxer_rxq::push_packet;
 
 pub struct VsockMuxer {
     cid: u64,
@@ -311,10 +282,16 @@ impl VsockMuxer {
     }
 
     /// Retry proxy work after the caller has released the guest RX queue.
-    pub(crate) fn kick_backends(&self) {
+    pub(crate) fn kick_backends(&self, notify_backends: bool) -> bool {
+        let mut signal_queue = false;
         for proxy in self.proxy_map.read().unwrap().values() {
-            proxy.lock().unwrap().kick();
+            let mut proxy = proxy.lock().unwrap();
+            signal_queue |= proxy.retry_rx();
+            if notify_backends {
+                proxy.kick();
+            }
         }
+        signal_queue
     }
 
     fn push_packet(&self, rx: MuxerRx) {
@@ -333,29 +310,7 @@ impl VsockMuxer {
             }
         };
 
-        let mut queue = queue_mutex.lock().unwrap();
-        let mut rxq = self.rxq.lock().unwrap();
-        if !rxq.is_empty() {
-            rxq.push(rx);
-            return;
-        }
-
-        if let Some(head) = queue.pop(mem) {
-            if let Ok(mut pkt) = VsockPacket::from_rx_virtq_head(&head) {
-                if rx_to_pkt(self.cid, rx, &mut pkt) {
-                    if let Err(e) =
-                        queue.add_used(mem, head.index, pkt.hdr().len() as u32 + pkt.len())
-                    {
-                        error!("failed to add used elements to the queue: {e:?}");
-                    }
-                } else {
-                    queue.undo_pop();
-                }
-            }
-        } else {
-            error!("couldn't push pkt to queue, adding it to rxq");
-            rxq.push(rx);
-        }
+        push_packet(self.cid, rx, &self.rxq, queue_mutex, mem);
     }
 
     pub fn update_polling(&self, id: u64, fd: RawFd, evset: EventSet) {
@@ -1263,6 +1218,87 @@ impl VsockMuxer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rx_capacity_retries_credit_without_another_socket_event() {
+        use std::io;
+
+        use super::super::{VsockShutdown, VsockStreamBackend};
+        use crate::virtio::{Descriptor, DescriptorChain};
+        use vm_memory::{Bytes, GuestAddress};
+
+        struct Sink;
+        impl VsockStreamBackend for Sink {
+            fn read(&self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+            fn write(&self, data: &[u8]) -> io::Result<usize> {
+                Ok(data.len())
+            }
+            fn shutdown(&self, _: VsockShutdown) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x20000)]).unwrap();
+        for (index, descriptor) in [
+            Descriptor {
+                addr: 0x2000,
+                len: 44,
+                flags: 1,
+                next: 1,
+            },
+            Descriptor {
+                addr: 0x3000,
+                len: 65536,
+                flags: 0,
+                next: 0,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            mem.write_obj(descriptor, GuestAddress(0x1000 + index as u64 * 16))
+                .unwrap();
+        }
+        mem.write_obj(65536u32.to_le(), GuestAddress(0x2018))
+            .unwrap();
+        let head = DescriptorChain::checked_new(&mem, GuestAddress(0x1000), 2, 0).unwrap();
+        let pkt = VsockPacket::from_tx_virtq_head(&head).unwrap();
+        let muxer = VsockMuxer::new(3, None, None, None, None, TsiFlags::empty());
+        let mut proxy = CustomStreamProxy::new(
+            1,
+            3,
+            5000,
+            4000,
+            Box::new(Sink),
+            VsockNotifier::new().unwrap(),
+            mem.clone(),
+            Arc::new(Mutex::new(VirtQueue::new(256))),
+            Arc::clone(&muxer.rxq),
+        )
+        .unwrap();
+        for port in 0..defs::MUXER_RXQ_SIZE {
+            assert!(muxer.rxq.lock().unwrap().push(MuxerRx::Reset {
+                local_port: port as u32,
+                peer_port: 1,
+            }));
+        }
+        proxy.sendmsg(&pkt);
+        muxer
+            .proxy_map
+            .write()
+            .unwrap()
+            .insert(1, Mutex::new(Box::new(proxy)));
+
+        muxer.rxq.lock().unwrap().clear();
+        muxer.kick_backends(false);
+
+        assert!(matches!(
+            muxer.rxq.lock().unwrap().pop(),
+            Some(MuxerRx::CreditUpdate { fwd_cnt: 65536, .. })
+        ));
+    }
 
     #[test]
     fn missing_stream_route_returns_reset_without_opening_a_proxy() {

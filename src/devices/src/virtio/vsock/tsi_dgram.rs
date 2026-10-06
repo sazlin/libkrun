@@ -315,7 +315,7 @@ impl Proxy for TsiDgramProxy {
     fn sendmsg(&mut self, pkt: &VsockPacket) -> ProxyUpdate {
         debug!("sendmsg");
 
-        let ret = if let Some(buf) = pkt.buf() {
+        let ret = if let Some(buf) = pkt.payload() {
             #[cfg(target_os = "macos")]
             let flags = MsgFlags::empty();
             #[cfg(target_os = "linux")]
@@ -363,7 +363,7 @@ impl Proxy for TsiDgramProxy {
         self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
 
         if let Some(addr) = self.sendto_addr {
-            if let Some(buf) = pkt.buf() {
+            if let Some(buf) = pkt.payload() {
                 #[cfg(target_os = "macos")]
                 let flags = MsgFlags::empty();
                 #[cfg(target_os = "linux")]

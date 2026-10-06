@@ -45,6 +45,7 @@ pub struct UnixProxy {
     peer_buf_alloc: u32,
     tx_cnt: Wrapping<u32>,
     last_tx_cnt_sent: Wrapping<u32>,
+    credit_request_pending: bool,
     push_cnt: Wrapping<u32>,
     rx_cnt: Wrapping<u32>,
     pending_write: VecDeque<u8>,
@@ -161,6 +162,7 @@ impl UnixProxy {
             path,
             tx_cnt: Wrapping(0),
             last_tx_cnt_sent: Wrapping(0),
+            credit_request_pending: false,
             push_cnt: Wrapping(0),
             rx_cnt: Wrapping(0),
             pending_write: VecDeque::new(),
@@ -202,6 +204,7 @@ impl UnixProxy {
             rx_cnt: Wrapping(0),
             tx_cnt: Wrapping(0),
             last_tx_cnt_sent: Wrapping(0),
+            credit_request_pending: false,
             peer_buf_alloc: 0,
             peer_fwd_cnt: Wrapping(0),
             push_cnt: Wrapping(0),
@@ -245,6 +248,7 @@ impl UnixProxy {
     /// Record peer flow-control state while a nonblocking route connect is pending.
     pub fn prepare_vsock_connect(&mut self, pkt: &VsockPacket) {
         self.peer_buf_alloc = pkt.buf_alloc();
+        self.credit_request_pending = false;
         self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
         self.local_port = pkt.dst_port();
         self.peer_port = pkt.src_port();
@@ -425,15 +429,16 @@ impl UnixProxy {
             return;
         }
 
-        self.last_tx_cnt_sent = self.tx_cnt;
         let rx = MuxerRx::CreditUpdate {
             buf_alloc: defs::CONN_TX_BUF_SIZE as u32,
             local_port: self.local_port,
             peer_port: self.peer_port,
             fwd_cnt: self.tx_cnt.0,
         };
-        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
-        update.signal_queue = true;
+        if push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem) {
+            self.last_tx_cnt_sent = self.tx_cnt;
+            update.signal_queue = true;
+        }
     }
 
     fn connected_poll_events(&self) -> EventSet {
@@ -618,6 +623,7 @@ impl Proxy for UnixProxy {
             pkt.fwd_cnt()
         );
         self.peer_buf_alloc = pkt.buf_alloc();
+        self.credit_request_pending = false;
         self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
 
         self.status = ProxyStatus::Connected;
@@ -657,6 +663,7 @@ impl Proxy for UnixProxy {
         );
 
         self.peer_buf_alloc = pkt.buf_alloc();
+        self.credit_request_pending = false;
         self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
 
         self.switch_to_connected();
@@ -705,6 +712,28 @@ impl Proxy for UnixProxy {
         }
     }
 
+    fn retry_rx(&mut self) -> bool {
+        let mut update = ProxyUpdate::default();
+        self.maybe_push_credit_update(&mut update);
+        if self.credit_request_pending && self.status == ProxyStatus::WaitingCreditUpdate {
+            let delivered = push_packet(
+                self.cid,
+                MuxerRx::CreditRequest {
+                    buf_alloc: defs::CONN_TX_BUF_SIZE as u32,
+                    local_port: self.local_port,
+                    peer_port: self.peer_port,
+                    fwd_cnt: self.tx_cnt.0,
+                },
+                &self.rxq,
+                &self.queue,
+                &self.mem,
+            );
+            self.credit_request_pending = !delivered;
+            update.signal_queue |= delivered;
+        }
+        update.signal_queue
+    }
+
     fn process_event(&mut self, evset: EventSet) -> ProxyUpdate {
         let mut update = ProxyUpdate::default();
 
@@ -740,13 +769,7 @@ impl Proxy for UnixProxy {
 
                 if wait_credit && self.status != ProxyStatus::WaitingCreditUpdate {
                     self.status = ProxyStatus::WaitingCreditUpdate;
-                    let rx = MuxerRx::CreditRequest {
-                        buf_alloc: defs::CONN_TX_BUF_SIZE as u32,
-                        local_port: self.local_port,
-                        peer_port: self.peer_port,
-                        fwd_cnt: self.tx_cnt.0,
-                    };
-                    update.push_credit_req = Some(rx);
+                    self.credit_request_pending = true;
                 }
 
                 if self.status == ProxyStatus::Closed {
@@ -828,6 +851,7 @@ impl Proxy for UnixProxy {
             }
         }
 
+        update.signal_queue |= self.retry_rx();
         update
     }
 }
